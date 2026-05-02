@@ -57,7 +57,13 @@ openhub://install/solobox/solobox-agent-bridge
 
 ## 本地调试
 
-将 `skill.yaml` 中的连接地址切到：
+当前测试服务器连接地址：
+
+```text
+ws://124.220.221.242/ws/agent/connect/
+```
+
+本地调试时，将 `skill.yaml` 中的连接地址切到：
 
 ```text
 ws://localhost:8000/ws/agent/connect/

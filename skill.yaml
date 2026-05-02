@@ -4,7 +4,7 @@ description: SoloBox Agent 接入 Skill，用于将 OpenClaw 或其他 Agent 容
 author: SoloBox Team
 
 connection:
-  websocket_url: wss://api.solobox.io/ws/agent/connect/
+  websocket_url: ws://124.220.221.242/ws/agent/connect/
   local_websocket_url: ws://localhost:8000/ws/agent/connect/
   auth:
     method: api_key
