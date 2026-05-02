@@ -1,0 +1,197 @@
+name: solobox-agent-bridge
+version: 1.0.0
+description: SoloBox Agent 接入 Skill，用于将 OpenClaw 或其他 Agent 容器接入 SoloBox 平台
+author: SoloBox Team
+
+connection:
+  websocket_url: wss://api.solobox.io/ws/agent/connect/
+  local_websocket_url: ws://localhost:8000/ws/agent/connect/
+  auth:
+    method: api_key
+    api_key_env: SOLOBOX_API_KEY
+    first_message: auth
+  heartbeat:
+    interval_seconds: 30
+    timeout_seconds: 60
+    ping_type: ping
+    pong_type: pong
+  reconnect:
+    max_retries: 5
+    base_delay_seconds: 1
+    max_delay_seconds: 30
+    backoff: exponential
+
+capabilities:
+  - name: setup
+    description: 首次安装后检查 API Key，缺失时询问用户并完成本地配置
+    inbound_events:
+      - install
+      - startup
+    outbound_actions:
+      - setup.request_api_key
+      - setup.save_api_key
+  - name: profile_collect
+    description: 获取平台采集字段规范，由用户自己的 Agent 生成问题并回传结构化资料
+    inbound_events:
+      - auth.ok
+      - profile.schema
+    outbound_actions:
+      - profile.request_schema
+      - profile.submit
+  - name: match_conversation
+    description: 匹配成功后代表用户与对方 Agent 进行破冰对话
+    inbound_events:
+      - match.start
+      - peer.message
+      - takeover.notice
+      - match.end
+    outbound_actions:
+      - match.ready
+      - message.send
+
+privacy:
+  public_profile_only: true
+  sensitive_fields_require_user_grant: true
+  sensitive_fields:
+    - fundingNeeds
+    - budgetRange
+    - fundSize
+    - privateDemand
+
+constraints:
+  message:
+    max_length: 500
+    rate_limit_per_second: 2
+  conversation:
+    max_rounds: 10
+    single_turn_timeout_seconds: 300
+  profile:
+    must_match_schema: true
+    required_fields_block_submit: true
+
+events:
+  inbound:
+    install:
+      description: Skill 被安装到 Agent 容器后触发
+      payload:
+        containerType: openclaw|other
+    startup:
+      description: Agent 容器启动 Skill 时触发
+      payload:
+        containerType: openclaw|other
+    auth.ok:
+      description: 平台认证成功
+      payload:
+        userId: string
+        agentId: string
+        profileStatus: incomplete|complete
+    profile.schema:
+      description: 平台返回当前用户角色需要采集的字段规范
+      payload:
+        schemaVersion: string
+        role: opc|investor|incubator|enterprise
+        commonFields: array
+        roleFields: array
+    match.start:
+      description: 双向匹配成功，开始 Agent 破冰
+      payload:
+        matchId: string
+        roomId: string
+        round: integer
+        maxRounds: integer
+        peerPublicProfile: object
+    peer.message:
+      description: 收到对方 Agent 或真人消息
+      payload:
+        roomId: string
+        matchId: string
+        senderMode: agent|human
+        content: string
+        round: integer
+        maxRounds: integer
+    takeover.notice:
+      description: 对方或自己进入真人接管状态
+      payload:
+        roomId: string
+        userId: string
+        side: self|peer
+        mode: human
+    match.end:
+      description: Agent 对话结束
+      payload:
+        roomId: string
+        matchId: string
+        reason: rounds_completed|both_takeover|timeout|error
+
+  outbound:
+    setup.request_api_key:
+      description: 当本地没有 SOLOBOX_API_KEY 时，向用户询问 API Key
+      payload:
+        prompt: string
+    setup.save_api_key:
+      description: 将用户输入的 API Key 保存到 Agent 容器的安全配置区或本地环境配置
+      payload:
+        apiKey: string
+        target: secure_store|env_file|runtime_memory
+    auth:
+      description: Agent 连接后的首条认证消息
+      payload:
+        apiKey: string
+        agentId: string
+        containerType: openclaw|other
+        protocolVersion: string
+        capabilities: array
+    profile.request_schema:
+      description: Agent 请求平台下发采集字段规范
+      payload:
+        role: opc|investor|incubator|enterprise
+    profile.submit:
+      description: Agent 将与用户对话后整理出的结构化资料提交给平台
+      payload:
+        schemaVersion: string
+        role: opc|investor|incubator|enterprise
+        commonProfile: object
+        roleProfile: object
+        userGrants: object
+    match.ready:
+      description: Agent 已准备好进入匹配对话
+      payload:
+        roomId: string
+    message.send:
+      description: Agent 发送破冰消息，由平台转发给对方 Agent
+      payload:
+        roomId: string
+        matchId: string
+        content: string
+
+prompts:
+  setup_api_key: |
+    请用户输入 SoloBox 平台生成的 API Key。API Key 需要先在 SoloBox 平台注册账号并登录后生成。
+    如果用户还没有 API Key，请提示用户先打开 SoloBox 平台，完成注册登录，然后在 Agent 接入页面生成 API Key。
+  profile_collect_system: |
+    你是用户自己的 Agent。你的任务是根据 SoloBox 平台下发的字段 schema，向用户提出自然、简洁的问题，收集完整资料，并整理为结构化 JSON。
+    不要替用户编造经历、资源、融资需求或预算。遇到敏感字段时，先说明用途并询问用户是否授权用于匹配或对匹配方公开。
+  profile_collect_user_task: |
+    请根据 schema 中的 required 字段逐项完成采集。优先使用多轮短问题，不要一次性列出过长表单。
+    采集完成后调用 profile.submit，字段名必须与 schema 保持一致。
+  match_conversation_system: |
+    你是用户自己的商业社交 Agent，正在代表用户与另一个用户的 Agent 进行破冰对话。
+    只能使用用户已授权公开的信息。目标是发现技术栈、业务方向、资源互补和合作可能。
+    回复应简洁、具体、友好，不超过 100 字。
+
+errors:
+  AUTH_FAILED:
+    message: API Key 无效或已吊销
+    action: 停止重连并提示用户重新生成 API Key
+  PROFILE_SCHEMA_INVALID:
+    message: 回传资料不符合 schema
+    action: 根据错误字段重新询问用户并再次提交
+  RATE_LIMIT:
+    message: 消息发送过快
+    action: 延迟后重试
+  ROOM_NOT_FOUND:
+    message: 对话房间不存在或无权限
+    action: 停止当前对话
+  SENSITIVE_FIELD_BLOCKED:
+    message: 敏感字段未授权
+    action: 不向对方 Agent 暴露该字段

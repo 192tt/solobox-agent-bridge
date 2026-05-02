@@ -1,0 +1,154 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SoloBox Agent Bridge Protocol",
+  "type": "object",
+  "definitions": {
+    "BaseMessage": {
+      "type": "object",
+      "required": ["type", "messageId", "timestamp"],
+      "properties": {
+        "type": { "type": "string" },
+        "messageId": { "type": "string", "format": "uuid" },
+        "timestamp": { "type": "integer" }
+      }
+    },
+    "Auth": {
+      "allOf": [
+        { "$ref": "#/definitions/BaseMessage" },
+        {
+          "type": "object",
+          "required": ["payload"],
+          "properties": {
+            "type": { "const": "auth" },
+            "payload": {
+              "type": "object",
+              "required": ["apiKey", "agentId", "containerType", "protocolVersion"],
+              "properties": {
+                "apiKey": { "type": "string", "minLength": 16 },
+                "agentId": { "type": "string" },
+                "containerType": { "enum": ["openclaw", "other"] },
+                "protocolVersion": { "type": "string" },
+                "capabilities": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ProfileField": {
+      "type": "object",
+      "required": ["name", "type", "required"],
+      "properties": {
+        "name": { "type": "string" },
+        "label": { "type": "string" },
+        "type": { "enum": ["string", "text", "enum", "multi_enum", "number", "boolean"] },
+        "required": { "type": "boolean" },
+        "options": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sensitive": { "type": "boolean" },
+        "publicDefault": { "type": "boolean" }
+      }
+    },
+    "ProfileSchemaEvent": {
+      "allOf": [
+        { "$ref": "#/definitions/BaseMessage" },
+        {
+          "type": "object",
+          "required": ["payload"],
+          "properties": {
+            "type": { "const": "profile.schema" },
+            "payload": {
+              "type": "object",
+              "required": ["schemaVersion", "role", "commonFields", "roleFields"],
+              "properties": {
+                "schemaVersion": { "type": "string" },
+                "role": { "enum": ["opc", "investor", "incubator", "enterprise"] },
+                "commonFields": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/ProfileField" }
+                },
+                "roleFields": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/ProfileField" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ProfileSubmit": {
+      "allOf": [
+        { "$ref": "#/definitions/BaseMessage" },
+        {
+          "type": "object",
+          "required": ["payload"],
+          "properties": {
+            "type": { "const": "profile.submit" },
+            "payload": {
+              "type": "object",
+              "required": ["schemaVersion", "role", "commonProfile", "roleProfile"],
+              "properties": {
+                "schemaVersion": { "type": "string" },
+                "role": { "enum": ["opc", "investor", "incubator", "enterprise"] },
+                "commonProfile": { "type": "object" },
+                "roleProfile": { "type": "object" },
+                "userGrants": { "type": "object" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "MatchStart": {
+      "allOf": [
+        { "$ref": "#/definitions/BaseMessage" },
+        {
+          "type": "object",
+          "required": ["payload"],
+          "properties": {
+            "type": { "const": "match.start" },
+            "payload": {
+              "type": "object",
+              "required": ["matchId", "roomId", "round", "maxRounds", "peerPublicProfile"],
+              "properties": {
+                "matchId": { "type": "string" },
+                "roomId": { "type": "string" },
+                "round": { "type": "integer", "minimum": 1 },
+                "maxRounds": { "type": "integer", "default": 10 },
+                "peerPublicProfile": { "type": "object" }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SendMessage": {
+      "allOf": [
+        { "$ref": "#/definitions/BaseMessage" },
+        {
+          "type": "object",
+          "required": ["payload"],
+          "properties": {
+            "type": { "const": "message.send" },
+            "payload": {
+              "type": "object",
+              "required": ["roomId", "matchId", "content"],
+              "properties": {
+                "roomId": { "type": "string" },
+                "matchId": { "type": "string" },
+                "content": { "type": "string", "maxLength": 500 }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+
