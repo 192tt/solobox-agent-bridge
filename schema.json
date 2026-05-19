@@ -98,7 +98,8 @@
                 "role": { "enum": ["opc", "investor", "incubator", "enterprise"] },
                 "commonProfile": { "type": "object" },
                 "roleProfile": { "type": "object" },
-                "userGrants": { "type": "object" }
+                "userGrants": { "type": "object" },
+                "partial": { "type": "boolean" }
               }
             }
           }

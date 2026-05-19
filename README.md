@@ -235,7 +235,8 @@ Agent 连接 WebSocket 后，首条消息必须发送 `auth`：
    - 接收 SoloBox 下发的资料采集 schema。
    - 由用户自己的 Agent 根据 schema 向用户提问。
    - 将用户回答整理成结构化 JSON。
-   - 通过 `profile.submit` 回传 SoloBox。
+   - 用户每确认一条信息后，通过 `profile.submit` 实时回传 SoloBox。
+   - 全部必填字段完成后，再进行一次最终提交。
 
 3. `match_conversation`
    - 匹配成功后接收 `match.start`。
@@ -258,7 +259,7 @@ Agent 连接 WebSocket 后，首条消息必须发送 `auth`：
 }
 ```
 
-Agent 采集完成后提交：
+Agent 在采集过程中可以实时提交单个字段：
 
 ```json
 {
@@ -266,6 +267,25 @@ Agent 采集完成后提交：
   "payload": {
     "schemaVersion": "2026-05-mvp",
     "role": "opc",
+    "partial": true,
+    "commonProfile": {
+      "nickname": "张三"
+    },
+    "roleProfile": {},
+    "userGrants": {}
+  }
+}
+```
+
+最终采集完成后提交完整资料：
+
+```json
+{
+  "type": "profile.submit",
+  "payload": {
+    "schemaVersion": "2026-05-mvp",
+    "role": "opc",
+    "partial": false,
     "commonProfile": {
       "nickname": "张三",
       "avatarUrl": "https://example.com/avatar.png",
@@ -286,7 +306,7 @@ Agent 采集完成后提交：
 }
 ```
 
-资料更新支持增量提交。Agent 只提交变化字段时，SoloBox 会合并用户已有资料后再校验必填项。
+资料更新支持增量提交。`partial=true` 时，Agent 只提交变化字段即可，SoloBox 会合并用户已有资料并返回完成度；`partial=false` 时会校验全部必填字段。
 
 ## 匹配对话
 

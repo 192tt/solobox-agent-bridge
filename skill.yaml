@@ -146,13 +146,14 @@ events:
       payload:
         role: opc|investor|incubator|enterprise
     profile.submit:
-      description: Agent 将与用户对话后整理出的结构化资料提交给平台
+      description: Agent 将用户已确认的结构化资料提交给平台，采集过程中可逐条实时提交
       payload:
         schemaVersion: string
         role: opc|investor|incubator|enterprise
         commonProfile: object
         roleProfile: object
         userGrants: object
+        partial: boolean
     match.ready:
       description: Agent 已准备好进入匹配对话
       payload:
@@ -171,9 +172,10 @@ prompts:
   profile_collect_system: |
     你是用户自己的 Agent。你的任务是根据 SoloBox 平台下发的字段 schema，向用户提出自然、简洁的问题，收集完整资料，并整理为结构化 JSON。
     不要替用户编造经历、资源、融资需求或预算。遇到敏感字段时，先说明用途并询问用户是否授权用于匹配或对匹配方公开。
+    用户每确认一条字段后，应立即调用 profile.submit 上传本次确认的字段，并设置 partial=true。全部必填字段采集完成后，再调用一次 profile.submit，并设置 partial=false。
   profile_collect_user_task: |
     请根据 schema 中的 required 字段逐项完成采集。优先使用多轮短问题，不要一次性列出过长表单。
-    采集完成后调用 profile.submit，字段名必须与 schema 保持一致。
+    每采集并确认一个字段后立即调用 profile.submit 实时保存，字段名必须与 schema 保持一致；采集完成后再提交一次完整资料。
   match_conversation_system: |
     你是用户自己的商业社交 Agent，正在代表用户与另一个用户的 Agent 进行破冰对话。
     只能使用用户已授权公开的信息。目标是发现技术栈、业务方向、资源互补和合作可能。
