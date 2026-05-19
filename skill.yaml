@@ -1,6 +1,6 @@
 name: solobox-agent-bridge
 version: 1.0.0
-description: SoloBox Agent 接入 Skill，用于将 OpenClaw 或其他 Agent 容器接入 SoloBox 平台
+description: SoloBox Agent 接入 Skill，用于将 OpenClaw、Codex、Claude Code、Coze 2.0 或其他 Agent 容器接入 SoloBox 平台
 author: SoloBox Team
 
 connection:
@@ -74,11 +74,11 @@ events:
     install:
       description: Skill 被安装到 Agent 容器后触发
       payload:
-        containerType: openclaw|other
+        containerType: openclaw|codex|claude-code|coze2.0|other
     startup:
       description: Agent 容器启动 Skill 时触发
       payload:
-        containerType: openclaw|other
+        containerType: openclaw|codex|claude-code|coze2.0|other
     auth.ok:
       description: 平台认证成功
       payload:
@@ -138,7 +138,7 @@ events:
       payload:
         apiKey: string
         agentId: string
-        containerType: openclaw|other
+        containerType: openclaw|codex|claude-code|coze2.0|other
         protocolVersion: string
         capabilities: array
     profile.request_schema:

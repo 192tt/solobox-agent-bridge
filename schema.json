@@ -26,7 +26,7 @@
               "properties": {
                 "apiKey": { "type": "string", "minLength": 16 },
                 "agentId": { "type": "string" },
-                "containerType": { "enum": ["openclaw", "other"] },
+                "containerType": { "enum": ["openclaw", "codex", "claude-code", "coze2.0", "other"] },
                 "protocolVersion": { "type": "string" },
                 "capabilities": {
                   "type": "array",
