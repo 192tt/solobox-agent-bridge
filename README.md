@@ -190,6 +190,40 @@ ws://124.220.221.242/ws/agent/connect/
 ws://localhost:8000/ws/agent/connect/
 ```
 
+## 长连接要求
+
+OpenClaw 发送 `auth` 并收到 `auth.ok` 只代表认证成功，不代表平台已持续在线。
+
+SoloBox 平台只在 WebSocket 仍然保持连接时显示 Agent 已连接。Agent 容器需要：
+
+- 收到 `auth.ok` 后继续保持 WebSocket。
+- 监听平台下发的 `ping`。
+- 每次收到 `ping` 后回复 `pong`。
+- WebSocket 异常断开后自动重连。
+- 重连后重新发送 `auth`。
+
+平台心跳：
+
+```json
+{
+  "type": "ping",
+  "payload": {
+    "intervalSeconds": 30
+  }
+}
+```
+
+Agent 回复：
+
+```json
+{
+  "type": "pong",
+  "payload": {}
+}
+```
+
+如果 OpenClaw 测试流程是“连接、发送 auth、收到 auth.ok、立即关闭连接”，SoloBox 会在断开后把状态标记为 `offline`，前端会继续显示未检测到长连接。
+
 ## 首次认证
 
 Agent 连接 WebSocket 后，首条消息必须发送 `auth`：
