@@ -1,3 +1,10 @@
+---
+name: solobox-agent-bridge
+description: "Connect the user's agent to SoloBox platform for profile onboarding, real-time profile updates, and agent-to-agent match conversations."
+description_zh: "将用户的 Agent 接入 SoloBox 平台，完成资料采集与实时更新，并代表用户参与匹配后的 Agent 破冰对话。"
+version: 1.1.0
+---
+
 # SoloBox Agent Bridge
 
 Use this skill when the user wants this agent to connect to SoloBox, complete SoloBox profile onboarding, update profile fields in real time, or participate in SoloBox match conversations on the user's behalf.
