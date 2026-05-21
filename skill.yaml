@@ -3,6 +3,12 @@ version: 1.0.0
 description: SoloBox Agent 接入 Skill，用于将 OpenClaw、Codex、Claude Code、Coze 2.0 或其他 Agent 容器接入 SoloBox 平台
 author: SoloBox Team
 
+entrypoint: index.js
+runtime: node
+dependencies:
+  npm:
+    - ws@^8.18.0
+
 connection:
   websocket_url: ws://124.220.221.242/ws/agent/connect/
   local_websocket_url: ws://localhost:8000/ws/agent/connect/

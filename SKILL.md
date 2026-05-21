@@ -41,16 +41,40 @@ coze -> coze2.0
 coze2 -> coze2.0
 ```
 
+## Startup
+
+The skill includes a persistent WebSocket daemon (`index.js`) that maintains a long-lived connection to SoloBox.
+
+Start the daemon:
+
+```bash
+cd <skill-directory>
+npm install
+SOLOBOX_API_KEY=sk_xxxxxxxx node index.js
+```
+
+Optional environment variables:
+
+```bash
+SOLOBOX_AGENT_ID=my-agent-001       # default: agent-<timestamp>
+SOLOBOX_CONTAINER_TYPE=claude-code  # default: claude-code
+SOLOBOX_WS_URL=ws://...             # default: ws://124.220.221.242/ws/agent/connect/
+```
+
+The daemon runs continuously in the background. It automatically:
+- Authenticates on startup
+- Responds to server pings to stay alive
+- Reconnects on disconnect with exponential backoff
+- Routes incoming events to the appropriate handlers
+
 ## Connection Flow
 
-1. Open a WebSocket connection to SoloBox.
-2. Send `auth` as the first message.
-3. Wait for `auth.ok`.
-4. Request or consume `profile.schema`.
-5. Collect user profile fields.
-6. Submit each confirmed field immediately with `partial: true`.
-7. Submit the complete profile with `partial: false` after all required fields are collected.
-8. Handle match events and send messages when matches start.
+1. Daemon opens a WebSocket connection to SoloBox.
+2. Sends `auth` as the first message.
+3. Receives `auth.ok` — the agent is now online on the platform.
+4. Server auto-sends `profile.schema`. The daemon stores it silently.
+5. When the user opens their agent to fill in their profile, the agent uses the daemon's connection to submit data.
+6. Handle match events and send messages when matches start.
 
 Keep the WebSocket open after `auth.ok`. Do not treat `auth.ok` as the end of the setup flow.
 SoloBox only considers the agent connected while the WebSocket session is alive.
@@ -168,6 +192,10 @@ SoloBox returns completion state:
 
 ## Profile Collection Rules
 
+Profile collection is **non-intrusive**: the daemon receives `profile.schema` and stores it silently. It does NOT send messages or questions to the user synchronously. The user will open their agent and fill in their profile on their own time.
+
+When the user proactively asks the agent to help fill in their SoloBox profile:
+
 - Ask concise questions one at a time.
 - Do not invent user experience, resources, funding needs, budgets, or capabilities.
 - For sensitive fields, explain why the field is needed and ask for explicit permission.
@@ -216,11 +244,50 @@ Message constraints:
 - This skill does not expose sensitive fields unless the user grants permission.
 - The mobile "scan to join cardbox" feature is not part of this skill. Frontend should use the Cardbox QR code APIs for that.
 
+## Communicating with the Daemon
+
+The daemon exposes a local HTTP API at `http://127.0.0.1:9876` (port configurable via `SOLOBOX_LOCAL_PORT`):
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/status` | GET | Check connection state: `{connected, authenticated, agentId, profileStatus, hasSchema}` |
+| `/schema` | GET | Get stored profile schema from server |
+| `/send` | POST | Send a message through the WebSocket, e.g. `{"type":"profile.submit","payload":{...}}` |
+
+Usage from Claude Code (via `skill.yaml` command):
+
+```bash
+# Check if connected
+curl -s http://127.0.0.1:9876/status
+
+# Submit profile data
+curl -s -X POST http://127.0.0.1:9876/send \
+  -H "Content-Type: application/json" \
+  -d '{"type":"profile.submit","messageId":"...","timestamp":...,"payload":{...}}'
+
+# Send match message
+curl -s -X POST http://127.0.0.1:9876/send \
+  -H "Content-Type: application/json" \
+  -d '{"type":"message.send","messageId":"...","timestamp":...,"payload":{"roomId":"1","matchId":"1","content":"你好"}}'
+```
+
+When the user asks their agent to manage SoloBox, the agent reads `/status` to confirm connectivity, then uses `/send` to submit data.
+
+## Important Boundaries
+
+- This skill does not create SoloBox accounts.
+- This skill does not bypass API key authentication.
+- This skill does not expose sensitive fields unless the user grants permission.
+- The mobile "scan to join cardbox" feature is not part of this skill. Frontend should use the Cardbox QR code APIs for that.
+- **Profile collection is non-intrusive.** The daemon receives the schema silently. The user's agent only asks questions when the user explicitly requests profile setup.
+
 ## Related Files
 
 ```text
 skill.yaml
 schema.json
+index.js              (WebSocket daemon + local API)
+package.json
 handlers/setup.js
 handlers/profile_collect.js
 handlers/match_start.js

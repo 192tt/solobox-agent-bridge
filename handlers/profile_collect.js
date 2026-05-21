@@ -1,52 +1,9 @@
 module.exports = async function profileCollect(event, context) {
   const schema = event.payload;
 
-  const prompt = context.renderPrompt("profile_collect_user_task", {
-    schema
-  });
+  // Store the schema for later use — do NOT prompt the user synchronously.
+  // The user will proactively open their agent to fill in their profile.
+  await context.secrets.set("SOLOBOX_PROFILE_SCHEMA", JSON.stringify(schema)).catch(() => {});
 
-  const emitPartial = async update => {
-    if (!context.emit || !update) return;
-    const payload = buildSubmitPayload(schema, update, true);
-    await context.emit({
-      type: "profile.submit",
-      payload
-    });
-  };
-
-  const collected = await context.llm.collectStructuredProfile(prompt, {
-    systemPrompt: context.prompts.profile_collect_system,
-    schema,
-    onFieldCollected: emitPartial,
-    onPartialProfile: emitPartial
-  });
-
-  return {
-    type: "profile.submit",
-    payload: buildSubmitPayload(schema, collected, false)
-  };
+  return null; // No auto-response — wait for the user to initiate profile collection
 };
-
-function buildSubmitPayload(schema, collected, partial) {
-  collected = collected || {};
-  return {
-    schemaVersion: schema.schemaVersion,
-    role: schema.role,
-    commonProfile: collected.commonProfile || pickFields(collected, schema.commonFields),
-    roleProfile: collected.roleProfile || pickFields(collected, schema.roleFields),
-    userGrants: collected.userGrants || {},
-    partial
-  };
-}
-
-function pickFields(source, fields) {
-  source = source || {};
-  const output = {};
-  for (const field of fields || []) {
-    if (Object.prototype.hasOwnProperty.call(source, field.name)) {
-      output[field.name] = source[field.name];
-    }
-  }
-  return output;
-}
-
