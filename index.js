@@ -39,6 +39,9 @@ let authenticated = false;
 let storedSchema = null;
 let storedProfileStatus = "incomplete";
 
+// 缓存匹配信息：roomId -> { peerPublicProfile, matchId }
+const matchCache = new Map();
+
 function log(level, msg, data) {
   const ts = new Date().toISOString();
   if (data) {
@@ -147,6 +150,38 @@ function cancelReconnect() {
   reconnectTimer = null;
 }
 
+// ---------------------------------------------------------------------------
+// LLM 由 Agent 容器注入，本文件不提供兜底实现
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 对话历史缓存（按 roomId 存储）
+// ---------------------------------------------------------------------------
+
+const conversationHistory = new Map();
+
+function addToHistory(roomId, role, content) {
+  if (!conversationHistory.has(roomId)) {
+    conversationHistory.set(roomId, []);
+  }
+  const history = conversationHistory.get(roomId);
+  history.push({ role, content, timestamp: Date.now() });
+  // 只保留最近 20 条
+  if (history.length > 20) {
+    history.shift();
+  }
+}
+
+function getHistory(roomId) {
+  return conversationHistory.get(roomId) || [];
+}
+
+function clearHistory(roomId) {
+  conversationHistory.delete(roomId);
+}
+
+// ---------------------------------------------------------------------------
+
 async function handleMessage(message) {
   log("info", "Received", message.type);
 
@@ -175,6 +210,13 @@ async function handleMessage(message) {
     case "match.start":
       if (handlers.match_start) {
         try {
+          // 缓存对方资料
+          if (message.payload.peerPublicProfile) {
+            matchCache.set(message.payload.roomId, {
+              peerPublicProfile: message.payload.peerPublicProfile,
+              matchId: message.payload.matchId,
+            });
+          }
           // Send ready first
           send({
             type: "match.ready",
@@ -183,7 +225,10 @@ async function handleMessage(message) {
             payload: { roomId: message.payload.roomId },
           });
           const result = await handlers.match_start(message, createContext());
-          if (result) send(result);
+          if (result) {
+            addToHistory(message.payload.roomId, "assistant", result.payload.content);
+            send(result);
+          }
         } catch (err) {
           log("error", "match_start handler error", err.message);
         }
@@ -193,8 +238,18 @@ async function handleMessage(message) {
     case "peer.message":
       if (handlers.peer_message) {
         try {
+          // 记录对方消息到历史
+          addToHistory(message.payload.roomId, "user", message.payload.content);
+          // 注入缓存的对方资料
+          const cached = matchCache.get(message.payload.roomId);
+          if (cached && cached.peerPublicProfile) {
+            message.payload.peerPublicProfile = cached.peerPublicProfile;
+          }
           const result = await handlers.peer_message(message, createContext());
-          if (result) send(result);
+          if (result) {
+            addToHistory(message.payload.roomId, "assistant", result.payload.content);
+            send(result);
+          }
         } catch (err) {
           log("error", "peer_message handler error", err.message);
         }
@@ -211,6 +266,7 @@ async function handleMessage(message) {
 
     case "match.end":
       log("info", "Match ended", message.payload);
+      clearHistory(message.payload.roomId);
       break;
 
     case "error":
@@ -238,25 +294,36 @@ function createContext() {
     },
     user: {
       promptSecret: async (opts) => {
-        // In a real container this would prompt the user; here we return env
         const val = process.env[opts.name];
         if (val) return val;
         throw new Error(`Missing required secret: ${opts.name}`);
       },
     },
-    prompts: {},
+    prompts: {
+      match_conversation_system: `你是用户的商业社交 Agent，正在代表用户与另一位创业者/投资人进行专业破冰对话。
+你的目标是：基于双方公开资料，发现技术互补、资源对接、业务合作的可能性。
+
+规则：
+1. 回复必须基于用户的实际资料和对方的资料，不要编造
+2. 开场白要具体、有针对性，提及对方的赛道/城市/身份，不要泛泛地说"很高兴认识你"
+3. 后续回复要承接对方的话题，提出具体的合作切入点或追问
+4. 语气友好、专业、简洁（50-100字）
+5. 不要重复同样的句式
+6. 如果聊了两三轮还没找到合作点，可以主动提出交换联系方式或约线下见面`,
+    },
     llm: {
       generate: async (opts) => {
-        log("warn", "llm.generate called but no LLM configured, returning placeholder");
-        return { text: "你好，很高兴认识你！期待进一步交流。" };
+        log("error", "llm.generate called but no LLM is configured. Please ensure your agent runtime (OpenClaw, Codex, Claude Code, etc.) provides an LLM implementation.");
+        throw new Error("LLM not configured. This agent container does not provide a language model. Please use a container that injects llm.generate, or configure an external LLM provider in your agent runtime.");
       },
       collectStructuredProfile: async (prompt, opts) => {
-        log("warn", "llm.collectStructuredProfile called but no LLM configured");
+        log("warn", "llm.collectStructuredProfile called but no LLM is configured.");
         return {};
       },
     },
     emit: async (msg) => send(msg),
     renderPrompt: (name, vars) => name,
+    getHistory: (roomId) => getHistory(roomId),
   };
 }
 
@@ -302,13 +369,10 @@ function connect() {
 
   ws.on("error", (err) => {
     log("error", "WebSocket error", err.message);
-    // ws.on("close") will fire after this
   });
 }
 
 // Local HTTP API — allows the user's agent to communicate through this daemon.
-// The daemon maintains the WebSocket; the agent (Claude Code etc.) sends
-// commands via POST http://localhost:9876/send.
 function startLocalAPI() {
   const server = http.createServer((req, res) => {
     res.setHeader("Content-Type", "application/json");
@@ -324,7 +388,6 @@ function startLocalAPI() {
 
     const url = new URL(req.url, "http://localhost");
 
-    // GET /status — check connection state
     if (req.method === "GET" && url.pathname === "/status") {
       const ready = ws && ws.readyState === WebSocket.OPEN && authenticated;
       res.writeHead(200);
@@ -338,14 +401,12 @@ function startLocalAPI() {
       return;
     }
 
-    // GET /schema — get stored profile schema
     if (req.method === "GET" && url.pathname === "/schema") {
       res.writeHead(200);
       res.end(JSON.stringify({ schema: storedSchema }));
       return;
     }
 
-    // POST /send — send a message through the WebSocket
     if (req.method === "POST" && url.pathname === "/send") {
       let body = "";
       req.on("data", (chunk) => { body += chunk; });
@@ -371,7 +432,7 @@ function startLocalAPI() {
     log("info", `Local API listening on http://127.0.0.1:${CONFIG.localPort}`);
     log("info", "  POST /send  — send message via WebSocket");
     log("info", "  GET /status — check connection state");
-    log("info", "  GET /schema — get stored profile schema");
+    log("info", "  GET /schema — get profile schema");
   });
 
   return server;
