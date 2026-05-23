@@ -21,13 +21,6 @@ const CONFIG = {
   },
 };
 
-const handlers = {
-  setup: require("./handlers/setup"),
-  profile_collect: require("./handlers/profile_collect"),
-  match_start: require("./handlers/match_start"),
-  peer_message: require("./handlers/peer_message"),
-};
-
 let ws = null;
 let pingTimer = null;
 let pongTimeout = null;
@@ -35,12 +28,44 @@ let reconnectAttempt = 0;
 let reconnectTimer = null;
 let authenticated = false;
 
-// Stored server state, populated by incoming events
 let storedSchema = null;
 let storedProfileStatus = "incomplete";
 
-// 缓存匹配信息：roomId -> { peerPublicProfile, matchId }
 const matchCache = new Map();
+
+// ---------------------------------------------------------------------------
+// Pending event cache — bridge receives events and exposes them via HTTP.
+// The agent container (qclaw, Claude Code, etc.) polls GET /event, uses its
+// OWN LLM to generate a response, then POSTs the reply via /send.
+// The bridge does NOT call any LLM itself.
+// ---------------------------------------------------------------------------
+
+let pendingEvent = null;
+
+// ---------------------------------------------------------------------------
+// Conversation history cache (per roomId)
+// ---------------------------------------------------------------------------
+
+const conversationHistory = new Map();
+
+function addToHistory(roomId, role, content) {
+  if (!conversationHistory.has(roomId)) {
+    conversationHistory.set(roomId, []);
+  }
+  const history = conversationHistory.get(roomId);
+  history.push({ role, content, timestamp: Date.now() });
+  if (history.length > 20) {
+    history.shift();
+  }
+}
+
+function getHistory(roomId) {
+  return conversationHistory.get(roomId) || [];
+}
+
+function clearHistory(roomId) {
+  conversationHistory.delete(roomId);
+}
 
 function log(level, msg, data) {
   const ts = new Date().toISOString();
@@ -109,7 +134,6 @@ function resetHeartbeat() {
     }
   }, CONFIG.heartbeat.timeoutSeconds * 1000);
 
-  // Send client-side pings to detect dead connections
   pingTimer = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.ping();
@@ -151,36 +175,6 @@ function cancelReconnect() {
 }
 
 // ---------------------------------------------------------------------------
-// LLM 由 Agent 容器注入，本文件不提供兜底实现
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// 对话历史缓存（按 roomId 存储）
-// ---------------------------------------------------------------------------
-
-const conversationHistory = new Map();
-
-function addToHistory(roomId, role, content) {
-  if (!conversationHistory.has(roomId)) {
-    conversationHistory.set(roomId, []);
-  }
-  const history = conversationHistory.get(roomId);
-  history.push({ role, content, timestamp: Date.now() });
-  // 只保留最近 20 条
-  if (history.length > 20) {
-    history.shift();
-  }
-}
-
-function getHistory(roomId) {
-  return conversationHistory.get(roomId) || [];
-}
-
-function clearHistory(roomId) {
-  conversationHistory.delete(roomId);
-}
-
-// ---------------------------------------------------------------------------
 
 async function handleMessage(message) {
   log("info", "Received", message.type);
@@ -204,56 +198,62 @@ async function handleMessage(message) {
 
     case "profile.schema":
       storedSchema = message.payload;
-      log("info", "Profile schema stored, waiting for user to fill in via agent");
+      log("info", "Profile schema stored");
       break;
 
     case "match.start":
-      if (handlers.match_start) {
-        try {
-          // 缓存对方资料
-          if (message.payload.peerPublicProfile) {
-            matchCache.set(message.payload.roomId, {
-              peerPublicProfile: message.payload.peerPublicProfile,
-              matchId: message.payload.matchId,
-            });
-          }
-          // Send ready first
-          send({
-            type: "match.ready",
-            messageId: generateId(),
-            timestamp: Date.now(),
-            payload: { roomId: message.payload.roomId },
-          });
-          const result = await handlers.match_start(message, createContext());
-          if (result) {
-            addToHistory(message.payload.roomId, "assistant", result.payload.content);
-            send(result);
-          }
-        } catch (err) {
-          log("error", "match_start handler error", err.message);
-        }
+      // Cache peer profile
+      if (message.payload.peerPublicProfile) {
+        matchCache.set(message.payload.roomId, {
+          peerPublicProfile: message.payload.peerPublicProfile,
+          matchId: message.payload.matchId,
+        });
       }
+      // Send match.ready immediately (no LLM needed)
+      send({
+        type: "match.ready",
+        messageId: generateId(),
+        timestamp: Date.now(),
+        payload: { roomId: message.payload.roomId },
+      });
+      // Cache the event for the agent to pick up via GET /event
+      pendingEvent = {
+        type: "match.start",
+        roomId: message.payload.roomId,
+        matchId: message.payload.matchId,
+        peerPublicProfile: message.payload.peerPublicProfile || {},
+        conversationHistory: message.payload.conversationHistory || [],
+        round: message.payload.round || 1,
+        maxRounds: message.payload.maxRounds || 10,
+      };
+      log("info", "Event cached: match.start room=" + message.payload.roomId);
       break;
 
     case "peer.message":
-      if (handlers.peer_message) {
-        try {
-          // 记录对方消息到历史
-          addToHistory(message.payload.roomId, "user", message.payload.content);
-          // 注入缓存的对方资料
-          const cached = matchCache.get(message.payload.roomId);
-          if (cached && cached.peerPublicProfile) {
-            message.payload.peerPublicProfile = cached.peerPublicProfile;
-          }
-          const result = await handlers.peer_message(message, createContext());
-          if (result) {
-            addToHistory(message.payload.roomId, "assistant", result.payload.content);
-            send(result);
-          }
-        } catch (err) {
-          log("error", "peer_message handler error", err.message);
-        }
+      // Record peer message in history
+      addToHistory(message.payload.roomId, "user", message.payload.content);
+      // Inject cached peer profile
+      const cached = matchCache.get(message.payload.roomId);
+      if (cached && cached.peerPublicProfile) {
+        message.payload.peerPublicProfile = cached.peerPublicProfile;
       }
+      // Cache the event for the agent to pick up
+      pendingEvent = {
+        type: "peer.message",
+        roomId: message.payload.roomId,
+        matchId: message.payload.matchId,
+        content: message.payload.content,
+        senderPublicProfile: message.payload.senderPublicProfile || {},
+        peerPublicProfile: message.payload.peerPublicProfile || cached?.peerPublicProfile || {},
+        conversationHistory: message.payload.conversationHistory || [],
+        round: message.payload.round || 0,
+        maxRounds: message.payload.maxRounds || 10,
+      };
+      log("info", "Event cached: peer.message room=" + message.payload.roomId);
+      break;
+
+    case "message.send.ok":
+      log("info", "Message sent OK", { peerOnline: message.payload?.peerOnline });
       break;
 
     case "takeover.notice":
@@ -267,6 +267,7 @@ async function handleMessage(message) {
     case "match.end":
       log("info", "Match ended", message.payload);
       clearHistory(message.payload.roomId);
+      clearPendingEvent();
       break;
 
     case "error":
@@ -284,48 +285,152 @@ async function handleMessage(message) {
   }
 }
 
-function createContext() {
-  return {
-    secrets: {
-      get: async (key) => process.env[key] || null,
-      set: async (key, value) => {
-        process.env[key] = value;
-      },
-    },
-    user: {
-      promptSecret: async (opts) => {
-        const val = process.env[opts.name];
-        if (val) return val;
-        throw new Error(`Missing required secret: ${opts.name}`);
-      },
-    },
-    prompts: {
-      match_conversation_system: `你是用户的商业社交 Agent，正在代表用户与另一位创业者/投资人进行专业破冰对话。
-你的目标是：基于双方公开资料，发现技术互补、资源对接、业务合作的可能性。
-
-规则：
-1. 回复必须基于用户的实际资料和对方的资料，不要编造
-2. 开场白要具体、有针对性，提及对方的赛道/城市/身份，不要泛泛地说"很高兴认识你"
-3. 后续回复要承接对方的话题，提出具体的合作切入点或追问
-4. 语气友好、专业、简洁（50-100字）
-5. 不要重复同样的句式
-6. 如果聊了两三轮还没找到合作点，可以主动提出交换联系方式或约线下见面`,
-    },
-    llm: {
-      generate: async (opts) => {
-        log("error", "llm.generate called but no LLM is configured. Please ensure your agent runtime (OpenClaw, Codex, Claude Code, etc.) provides an LLM implementation.");
-        throw new Error("LLM not configured. This agent container does not provide a language model. Please use a container that injects llm.generate, or configure an external LLM provider in your agent runtime.");
-      },
-      collectStructuredProfile: async (prompt, opts) => {
-        log("warn", "llm.collectStructuredProfile called but no LLM is configured.");
-        return {};
-      },
-    },
-    emit: async (msg) => send(msg),
-    renderPrompt: (name, vars) => name,
-    getHistory: (roomId) => getHistory(roomId),
-  };
+function clearPendingEvent() {
+  pendingEvent = null;
 }
+
+// ---------------------------------------------------------------------------
+// Local HTTP API
+// ---------------------------------------------------------------------------
+
+function startLocalAPI() {
+  const server = http.createServer((req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+
+    const url = new URL(req.url, "http://localhost");
+
+    // GET /status — connection state
+    if (req.method === "GET" && url.pathname === "/status") {
+      const ready = ws && ws.readyState === WebSocket.OPEN && authenticated;
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        connected: ready,
+        authenticated,
+        agentId: CONFIG.agentId,
+        profileStatus: storedProfileStatus,
+        hasSchema: storedSchema !== null,
+        hasPendingEvent: pendingEvent !== null,
+      }));
+      return;
+    }
+
+    // GET /event — get latest pending event + system prompt for agent
+    if (req.method === "GET" && url.pathname === "/event") {
+      if (pendingEvent) {
+        const round = pendingEvent.round || 1;
+        const maxRounds = pendingEvent.maxRounds || 10;
+        const phase = round <= 2 ? "intro" : (round <= 4 ? "match" : "cooperate");
+
+        const phaseGuidance = {
+          intro: "这是对话初期。先简单介绍己方背景和核心优势，点到为止，不要展开太多。提及对方昵称和城市以示尊重。50-80字。",
+          match: "基于双方资料分析契合点。结合对方赛道、合作类型、需求，说明我方能提供的资源或能力。提出1-2个具体的合作切入点。60-100字。",
+          cooperate: "推进到具体合作层面。提出明确的下一步建议：交换联系方式、约线上会议、资源对接、联合运营等。语气积极但不急迫。50-100字。",
+        };
+
+        const systemPrompt = [
+          "你是用户的商业社交 Agent，正在代表用户与另一位创业者/投资人进行专业对接对话。",
+          "",
+          "对话分三个阶段，当前处于阶段：",
+          `第 ${round}/${maxRounds} 轮 → 【${phase === "intro" ? "阶段一：自我介绍" : (phase === "match" ? "阶段二：资料匹配" : "阶段三：合作推进")}】`,
+          "",
+          "阶段规则：",
+          "- 阶段一（1-2轮）：简要自我介绍，提及己方核心优势和资源",
+          "- 阶段二（3-4轮）：结合双方资料分析契合点，提出合作切入",
+          "- 阶段三（5轮+）：推进具体合作，建议下一步行动（交换联系方式、约见面、资源对接）",
+          "",
+          "通用规则：",
+          "1. 称呼对方昵称，提及对方城市/赛道/身份",
+          "2. 回复具体有针对性，不要泛泛而谈",
+          "3. 基于双方真实资料，不编造信息",
+          "4. 不要重复同样的句式",
+          `5. 当前轮次指导：${phaseGuidance[phase]}`,
+        ].join("\n");
+
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          ok: true,
+          event: pendingEvent,
+          systemPrompt,
+          meta: { phase, round, maxRounds },
+        }));
+      } else {
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, event: null }));
+      }
+      return;
+    }
+
+    // DELETE /event — acknowledge event handled by agent
+    if (req.method === "DELETE" && url.pathname === "/event") {
+      clearPendingEvent();
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    // GET /schema — get profile schema
+    if (req.method === "GET" && url.pathname === "/schema") {
+      res.writeHead(200);
+      res.end(JSON.stringify({ schema: storedSchema }));
+      return;
+    }
+
+    // POST /send — agent sends message via WebSocket
+    if (req.method === "POST" && url.pathname === "/send") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        try {
+          const msg = JSON.parse(body);
+          const success = send(msg);
+          if (success && msg.payload && msg.payload.content) {
+            addToHistory(msg.payload.roomId, "assistant", msg.payload.content);
+          }
+          res.writeHead(success ? 200 : 503);
+          res.end(JSON.stringify({ ok: success, type: msg.type }));
+        } catch (err) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+      });
+      return;
+    }
+
+    // GET /history?roomId=X — get conversation history for a room
+    if (req.method === "GET" && url.pathname === "/history") {
+      const roomId = url.searchParams.get("roomId");
+      res.writeHead(200);
+      res.end(JSON.stringify({ history: roomId ? getHistory(roomId) : [] }));
+      return;
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+
+  server.listen(CONFIG.localPort, "127.0.0.1", () => {
+    log("info", `Local API listening on http://127.0.0.1:${CONFIG.localPort}`);
+    log("info", "  GET  /event   — poll for pending match/peer events");
+    log("info", "  DELETE /event — ack event after handling");
+    log("info", "  POST /send    — send message via WebSocket");
+    log("info", "  GET  /status  — check connection state");
+    log("info", "  GET  /history?roomId=X — get conversation history");
+    log("info", "  GET  /schema  — get profile schema");
+  });
+
+  return server;
+}
+
+// ---------------------------------------------------------------------------
 
 function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -372,72 +477,6 @@ function connect() {
   });
 }
 
-// Local HTTP API — allows the user's agent to communicate through this daemon.
-function startLocalAPI() {
-  const server = http.createServer((req, res) => {
-    res.setHeader("Content-Type", "application/json");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-    if (req.method === "OPTIONS") {
-      res.writeHead(200);
-      res.end();
-      return;
-    }
-
-    const url = new URL(req.url, "http://localhost");
-
-    if (req.method === "GET" && url.pathname === "/status") {
-      const ready = ws && ws.readyState === WebSocket.OPEN && authenticated;
-      res.writeHead(200);
-      res.end(JSON.stringify({
-        connected: ready,
-        authenticated,
-        agentId: CONFIG.agentId,
-        profileStatus: storedProfileStatus,
-        hasSchema: storedSchema !== null,
-      }));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/schema") {
-      res.writeHead(200);
-      res.end(JSON.stringify({ schema: storedSchema }));
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/send") {
-      let body = "";
-      req.on("data", (chunk) => { body += chunk; });
-      req.on("end", () => {
-        try {
-          const msg = JSON.parse(body);
-          const success = send(msg);
-          res.writeHead(success ? 200 : 503);
-          res.end(JSON.stringify({ ok: success, type: msg.type }));
-        } catch (err) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ ok: false, error: err.message }));
-        }
-      });
-      return;
-    }
-
-    res.writeHead(404);
-    res.end(JSON.stringify({ error: "not found" }));
-  });
-
-  server.listen(CONFIG.localPort, "127.0.0.1", () => {
-    log("info", `Local API listening on http://127.0.0.1:${CONFIG.localPort}`);
-    log("info", "  POST /send  — send message via WebSocket");
-    log("info", "  GET /status — check connection state");
-    log("info", "  GET /schema — get profile schema");
-  });
-
-  return server;
-}
-
 let apiServer = null;
 
 function shutdown() {
@@ -465,14 +504,11 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
-// Validate required config
 if (!CONFIG.apiKey) {
   log("error", "SOLOBOX_API_KEY environment variable is required");
   log("info", "Set it with: export SOLOBOX_API_KEY=sk_your_api_key");
-  log("info", "Optional: SOLOBOX_AGENT_ID, SOLOBOX_CONTAINER_TYPE, SOLOBOX_LOCAL_PORT");
 }
 
-// Start
 apiServer = startLocalAPI();
 connect();
 
