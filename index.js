@@ -290,6 +290,168 @@ function clearPendingEvent() {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-respond polling — every 30s, check for pending events and auto-reply
+// using the user's own LLM (configured via env vars on their machine).
+// ---------------------------------------------------------------------------
+
+const LLM_CONFIG = {
+  apiUrl: process.env.LLM_API_URL || "",
+  apiKey: process.env.LLM_API_KEY || "",
+  model: process.env.LLM_MODEL || "qwen-turbo",
+};
+
+function buildSystemPrompt(event) {
+  const round = event.round || 1;
+  const maxRounds = event.maxRounds || 10;
+  const phase = round <= 2 ? "intro" : (round <= 4 ? "match" : "cooperate");
+
+  const phaseGuidance = {
+    intro: "对话初期。先简单介绍己方背景和核心优势，点到为止。提及对方昵称和城市。50-80字。",
+    match: "结合双方资料分析契合点。提出1-2个具体的合作切入点。60-100字。",
+    cooperate: "推进到具体合作。提出明确下一步：交换联系方式、约线上会议、资源对接等。50-100字。",
+  };
+
+  return [
+    "你是用户的商业社交 Agent，代表用户进行专业对接对话。",
+    `当前第 ${round}/${maxRounds} 轮。`,
+    "规则：",
+    "- 称呼对方昵称，提及对方城市/赛道/身份",
+    "- 回复具体有针对性，不泛泛而谈",
+    "- 基于双方真实资料，不编造",
+    "- 不要重复同样的句式",
+    `- ${phaseGuidance[phase]}`,
+  ].join("\n");
+}
+
+function buildLLMPrompt(event) {
+  const peer = event.peerPublicProfile || event.senderPublicProfile || {};
+  const peerName = peer.nickname || "对方";
+  const peerCity = peer.city || "";
+  const peerIdentity = peer.coreIdentity || "";
+  const peerTracks = (peer.focusTracks || []).join("、");
+  const peerLooking = peer.lookingFor || "";
+
+  if (event.type === "match.start") {
+    return `匹配开始！请生成开场白。\n对方：${peerName}（${peerCity}，${peerIdentity}，赛道：${peerTracks}，寻找：${peerLooking}）`;
+  }
+
+  const content = event.content || "";
+  const history = (event.conversationHistory || [])
+    .slice(-6)
+    .map(h => `${h.senderUserId === "108" ? peerName : "我方"}：${h.content}`)
+    .join("\n");
+
+  return [
+    `对方：${peerName}（${peerCity}，${peerIdentity}，赛道：${peerTracks}）`,
+    `对话历史：\n${history || "（首条消息）"}`,
+    `对方最新消息："${content}"`,
+    "请生成回复。",
+  ].join("\n");
+}
+
+async function llmGenerate(systemPrompt, userMessage) {
+  if (!LLM_CONFIG.apiKey) {
+    log("warn", "LLM_API_KEY not set, cannot auto-respond");
+    return null;
+  }
+
+  const body = {
+    model: LLM_CONFIG.model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ],
+    max_tokens: 200,
+    temperature: 0.7,
+  };
+
+  try {
+    const resp = await fetch(LLM_CONFIG.apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${LLM_CONFIG.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout ? AbortSignal.timeout(30000) : undefined,
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      log("error", `LLM API error ${resp.status}: ${errText.slice(0, 150)}`);
+      return null;
+    }
+
+    const data = await resp.json();
+    return data.choices?.[0]?.message?.content || null;
+  } catch (err) {
+    log("error", `LLM call failed: ${err.message}`);
+    return null;
+  }
+}
+
+async function autoRespond() {
+  if (!pendingEvent || !authenticated) return;
+
+  const event = pendingEvent;
+  // Don't respond if we already sent for this event (debounce)
+  if (event._handled) return;
+  event._handled = true;
+
+  log("info", `Auto-responding to ${event.type} room=${event.roomId}`);
+
+  const systemPrompt = buildSystemPrompt(event);
+  const userMessage = buildLLMPrompt(event);
+  const text = await llmGenerate(systemPrompt, userMessage);
+
+  if (!text) {
+    event._handled = false;
+    return;
+  }
+
+  const msg = {
+    type: "message.send",
+    messageId: generateId(),
+    timestamp: Date.now(),
+    payload: {
+      roomId: event.roomId,
+      matchId: event.matchId,
+      content: text,
+    },
+  };
+
+  const sent = send(msg);
+  if (sent) {
+    addToHistory(event.roomId, "assistant", text);
+    clearPendingEvent();
+    log("info", `Auto-response sent: ${text.slice(0, 60)}`);
+  } else {
+    event._handled = false;
+  }
+}
+
+let pollTimer = null;
+
+function startAutoPolling() {
+  const intervalMs = parseInt(process.env.SOLOBOX_POLL_INTERVAL || "30000", 10);
+  log("info", `Auto-poll started every ${intervalMs / 1000}s`);
+  pollTimer = setInterval(async () => {
+    try {
+      await autoRespond();
+    } catch (err) {
+      log("error", `Auto-respond error: ${err.message}`);
+    }
+  }, intervalMs);
+}
+
+function stopAutoPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Local HTTP API
 // ---------------------------------------------------------------------------
 
@@ -419,12 +581,13 @@ function startLocalAPI() {
 
   server.listen(CONFIG.localPort, "127.0.0.1", () => {
     log("info", `Local API listening on http://127.0.0.1:${CONFIG.localPort}`);
-    log("info", "  GET  /event   — poll for pending match/peer events");
+    log("info", "  GET  /event   — poll for pending events (manual)");
     log("info", "  DELETE /event — ack event after handling");
     log("info", "  POST /send    — send message via WebSocket");
     log("info", "  GET  /status  — check connection state");
     log("info", "  GET  /history?roomId=X — get conversation history");
     log("info", "  GET  /schema  — get profile schema");
+    log("info", "  Auto-poll: enabled (SOLOBOX_POLL_INTERVAL, default 30s)");
   });
 
   return server;
@@ -481,6 +644,7 @@ let apiServer = null;
 
 function shutdown() {
   log("info", "Shutting down");
+  stopAutoPolling();
   clearHeartbeat();
   cancelReconnect();
   if (apiServer) {
@@ -511,5 +675,6 @@ if (!CONFIG.apiKey) {
 
 apiServer = startLocalAPI();
 connect();
+startAutoPolling();
 
 module.exports = { connect, shutdown, send, CONFIG };
